@@ -94,32 +94,40 @@ int pool_active(const Pool *pool)
  *
  * TODO: implemente esta função.
  * ========================================================================= */
-void launch_worker(Pool *pool, const RenderParams *params, const Tile *t)
+void launch_worker(Pool *pool, const RenderParams *params, const Tile *t) 
 {
     (void)pool;
     (void)params;
     (void)t;
 
-    /* Dica de estrutura:
-     *
-     * int fd[2];
-     * if (pipe(fd) == -1) { perror("pipe"); return; }
-     *
-     * pid_t pid = fork();
-     * if (pid < 0) { perror("fork"); close(fd[0]); close(fd[1]); return; }
-     *
-     * if (pid == 0) {
-     *     // filho
-     *     close(fd[0]);
-     *     worker_main(params, t, fd[1]);
-     *     // worker_main não retorna
-     * }
-     *
-     * // pai
-     * close(fd[1]);
-     * // registrar pid e fd[0] em uma entrada livre do pool
-     * // incrementar pool->active
-     */
+
+    int fd[2];
+    if (pipe(fd) == -1) { perror("pipe"); return; }
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); close(fd[0]); close(fd[1]); return; }
+    
+    if (pid == 0) {
+        // filho
+        close(fd[0]);
+        worker_main(params, t, fd[1]); // worker_main não retorna
+    }
+    
+    // pai
+    close(fd[1]);
+
+    // registrar pid e fd[0] em uma entrada livre do pool
+    // incrementar pool->active
+    // Encontrar uma entrada livre no pool 
+    for (int i = 0; i < pool->max; i++) {
+        if (pool->entries[i].pid == -1) {
+            pool->entries[i].pid = pid;
+            pool->entries[i].read_fd = fd[0];
+            pool->active++;
+            break;
+        }
+    }
+    
 }
 
 /* =========================================================================
@@ -133,24 +141,32 @@ void worker_main(const RenderParams *params, const Tile *tile, int write_fd)
     (void)tile;
     (void)write_fd;
 
-    /* Dica de estrutura:
-     *
-     * int n_pixels = tile->w * tile->h;
-     * unsigned char *buf = malloc(n_pixels);
-     * if (!buf) { perror("malloc"); exit(1); }
-     *
-     * compute_tile(params, tile, buf);
-     *
-     * // Escrever cabeçalho: ox, oy, w, h
-     * // Escrever pixels
-     * // Lembre: use um loop para garantir que todos os bytes foram escritos!
-     *
-     * close(write_fd);
-     * free(buf);
-     * exit(0);
-     */
+    int n_pixels = tile->w * tile->h;
+    unsigned char *buf = malloc(n_pixels);
+    if (!buf) { perror("malloc"); exit(1); }
 
-    exit(0); /* remova esta linha quando implementar */
+    compute_tile(params, tile, buf);
+
+    // Escrever cabeçalho: ox, oy, w, h
+    int header[4] = { tile->ox, tile->oy, tile->w, tile->h };
+    if (write(write_fd, header, sizeof(header)) == -1) {
+        perror("write header");
+        free(buf);
+        exit(1);
+    }
+
+    // Escrever pixels
+    // Lembre: use um loop para garantir que todos os bytes foram escritos!
+    int total_sent = 0;
+    while (total_sent < n_pixels) {
+        ssize_t sent = write(write_fd, buf + total_sent, n_pixels - total_sent);
+        if (sent <= 0) break; 
+        total_sent += sent;
+    }
+
+    close(write_fd);
+    free(buf);
+    exit(0);
 }
 
 /* =========================================================================
@@ -164,30 +180,62 @@ int pool_collect_ready(Pool *pool, TileResult *result)
 
     if (pool->active == 0) return 0;
 
-    /* Dica de estrutura com select():
-     *
-     * fd_set rfds;
-     * FD_ZERO(&rfds);
-     * int maxfd = -1;
-     * for (int i = 0; i < pool->max; i++) {
-     *     if (pool->entries[i].pid != -1) {
-     *         FD_SET(pool->entries[i].read_fd, &rfds);
-     *         if (pool->entries[i].read_fd > maxfd)
-     *             maxfd = pool->entries[i].read_fd;
-     *     }
-     * }
-     *
-     * struct timeval tv = {0, 0}; // timeout zero = não bloqueia
-     * int ready = select(maxfd + 1, &rfds, NULL, NULL, &tv);
-     * if (ready <= 0) return 0;
-     *
-     * // Para cada entrada com dados:
-     * //   ler cabeçalho (4 ints: ox, oy, w, h)
-     * //   alocar result->pixels com malloc(w * h)
-     * //   ler w*h bytes (em loop)
-     * //   preencher result->tile
-     * //   retornar 1
-     */
+    // Dica de estrutura com select():
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    int maxfd = -1;
+
+    for (int i = 0; i < pool->max; i++) {
+        if (pool->entries[i].pid != -1) {
+            FD_SET(pool->entries[i].read_fd, &rfds);
+            if (pool->entries[i].read_fd > maxfd)
+                maxfd = pool->entries[i].read_fd;
+        }
+    }
+
+    struct timeval tv = {0, 0}; // timeout zero = não bloqueia
+    int ready = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+    if (ready <= 0) return 0;
+
+
+    // Para cada entrada com dados:
+    for (int i = 0; i < pool->max; i++) {
+        int fd = pool->entries[i].read_fd;
+        if (pool->entries[i].pid != -1 && FD_ISSET(fd, &rfds)) {
+            
+            // Ler cabeçalho (4 ints: ox, oy, w, h)
+            int header[4];
+            if (read(fd, header, sizeof(header)) < (ssize_t)sizeof(header)) {
+                return 0; // Leitura incompleta ou erro
+            }
+
+            result->tile.ox = header[0];
+            result->tile.oy = header[1];
+            result->tile.w  = header[2];
+            result->tile.h  = header[3];
+
+            // Alocar result->pixels com malloc(w * h)
+            int n_pixels = result->tile.w * result->tile.h;
+            result->pixels = malloc(n_pixels);
+            if (!result->pixels) return 0;
+
+            // Ler os pixels em loop
+            int total_read = 0;
+            while (total_read < n_pixels) {
+                ssize_t bytes = read(fd, result->pixels + total_read, n_pixels - total_read);
+                if (bytes <= 0) break;
+                total_read += bytes;
+            }
+
+            close(pool->entries[i].read_fd);
+            pool->entries[i].pid = -1;
+            pool->entries[i].read_fd = -1;
+            pool->active--;
+
+            return 1; // Sucesso
+        }
+    }
+
 
     return 0;
 }
@@ -199,15 +247,27 @@ int pool_collect_ready(Pool *pool, TileResult *result)
  * ========================================================================= */
 void pool_reap(Pool *pool)
 {
-    /* Dica de estrutura:
-     *
-     * int status;
-     * pid_t pid;
-     * while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-     *     // encontrar a entrada com esse pid no pool
-     *     // fechar o read_fd correspondente
-     *     // marcar a entrada como livre (pid = -1, read_fd = -1)
-     *     // decrementar pool->active
-     * }
-     */
+
+    int status;
+    pid_t pid;
+
+    // Enquanto existirem filhos que terminaram (sem bloquear):
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        // encontrar a entrada com esse pid no pool
+        for (int i = 0; i < pool->max; i++) {
+            if (pool->entries[i].pid == pid) {
+
+                // fechar o read_fd correspondente
+                close(pool->entries[i].read_fd);
+
+                // marcar a entrada como livre (pid = -1, read_fd = -1)
+                pool->entries[i].pid = -1;
+                pool->entries[i].read_fd = -1;
+
+                pool->active--;
+                break;
+            }
+        }
+    }
+
 }
