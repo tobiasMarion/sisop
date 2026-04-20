@@ -36,6 +36,24 @@
 #include <semaphore.h>
 
 /* =========================================================================
+ * Inicialização do mutex e semaforo
+ * ========================================================================= */
+
+
+// orion ---> lua 
+sem_t semaforo_orion_lua_vazio;
+sem_t semaforo_orion_lua_cheio;
+pthread_mutex_t mutex_orion_lua;
+
+// lua ---> terra 
+sem_t semaforo_lua_terra_vazio;
+sem_t semaforo_lua_terra_cheio;
+pthread_mutex_t mutex_lua_terra;
+
+//mutex para contadores
+pthread_mutex_t mutex;
+
+/* =========================================================================
  * Estruturas de dados
  * ========================================================================= */
 
@@ -192,12 +210,27 @@ static void *orion(void *arg)
     /* Delay de transmissão via rádio (1-3 ms) */
     usleep((1 + meu_id % 3) * 1000);
 
+
+    //REGIÃO CRITICA
+    //COMEÇO
+    //SEMAFORO
+    sem_wait(&semaforo_orion_lua_vazio);
+    pthread_mutex_lock(&mutex_orion_lua);
+
     buffer_inserir(&ctx->buf_orion_lua, &p);
 
+    pthread_mutex_unlock(&mutex_orion_lua);
+    sem_post(&semaforo_orion_lua_cheio);
+
+    //MUTEX
+    pthread_mutex_lock(&mutex); 
     ctx->total_enviados++;
+    pthread_mutex_unlock(&mutex);
+
+    //FIM
 
     printf("[Orion %ld] seq=%d enviado | total=%ld\n",
-	   meu_id, seq, ctx->total_enviados);
+	  meu_id, seq, ctx->total_enviados);
   }
   return NULL;
 }
@@ -218,7 +251,15 @@ static void *relay(void *arg)
   for (int i = 0; i < total_esperado; i++) {
 
     Pacote p;
+    //SEMAFORO
+    
+    sem_wait(&semaforo_orion_lua_cheio);
+    pthread_mutex_lock(&mutex_orion_lua);
+
     buffer_remover(&ctx->buf_orion_lua, &p);
+
+    pthread_mutex_unlock(&mutex_orion_lua);
+    sem_post(&semaforo_orion_lua_vazio);
 
     /* Processamento: calcula checksum e timestamp */
     PacoteRelay pr;
@@ -236,7 +277,15 @@ static void *relay(void *arg)
     /* Delay FTL simulado (muito menor que rádio) */
     usleep(20);
 
+    //REGIAO CRITICA
+    //SEMAFORO
+    sem_wait(&semaforo_lua_terra_vazio);
+    pthread_mutex_lock(&mutex_lua_terra);
+
     buffer_inserir(&ctx->buf_lua_terra, &pr);
+
+    pthread_mutex_unlock(&mutex_lua_terra);
+    sem_post(&semaforo_lua_terra_cheio);
 
     ctx->total_relay++;
   }
@@ -258,7 +307,14 @@ static void *terra(void *arg)
   for (int i = 0; i < total_esperado; i++) {
 
     PacoteRelay pr;
+    //REGIAO CRITICA
+    sem_wait(&semaforo_lua_terra_cheio);
+    pthread_mutex_lock(&mutex_lua_terra);
+
     buffer_remover(&ctx->buf_lua_terra, &pr);
+
+    pthread_mutex_unlock(&mutex_lua_terra);
+    sem_post(&semaforo_lua_terra_vazio);
 
     /* Validação de integridade */
     unsigned int cs = calcular_checksum(&pr.original);
@@ -317,6 +373,18 @@ int main(int argc, char *argv[])
   buffer_init(&ctx.buf_orion_lua, buf_orion_lua, sizeof(Pacote));
   buffer_init(&ctx.buf_lua_terra, buf_lua_terra, sizeof(PacoteRelay));
 
+  /* inicialização dos semaforos e mutex */
+
+  sem_init(&semaforo_orion_lua_vazio, 0, buf_orion_lua);
+  sem_init(&semaforo_orion_lua_cheio, 0, 0);
+  pthread_mutex_init(&mutex_orion_lua, NULL);
+
+  sem_init(&semaforo_lua_terra_vazio, 0, buf_lua_terra);
+  sem_init(&semaforo_lua_terra_cheio, 0, 0);
+  pthread_mutex_init(&mutex_lua_terra, NULL);
+
+  pthread_mutex_init(&mutex, NULL);
+
   /* Criação das threads */
   pthread_t *threads_orion = calloc(n_orions, sizeof(pthread_t));
   pthread_t  thread_relay = {0}, thread_terra = {0};
@@ -333,6 +401,18 @@ int main(int argc, char *argv[])
   }
   pthread_join(thread_relay, NULL);
   pthread_join(thread_terra, NULL);
+
+  /* Limpeza dos mutex e semaforos */
+  sem_destroy(&semaforo_orion_lua_vazio);
+  sem_destroy(&semaforo_orion_lua_cheio);
+  pthread_mutex_destroy(&mutex_orion_lua);
+
+  sem_destroy(&semaforo_lua_terra_vazio);
+  sem_destroy(&semaforo_lua_terra_cheio);
+  pthread_mutex_destroy(&mutex_lua_terra);
+
+  pthread_mutex_destroy(&mutex);
+  
 
   /* Limpeza final */
   buffer_destruir(&ctx.buf_orion_lua);
