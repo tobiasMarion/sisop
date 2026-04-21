@@ -43,6 +43,8 @@
 // orion ---> lua 
 sem_t semaforo_orion_lua_vazio;
 sem_t semaforo_orion_lua_cheio;
+sem_t semaforo_orion_lua_cheio_alerta;
+sem_t semaforo_orion_lua_cheio_normal;
 pthread_mutex_t mutex_orion_lua;
 
 // lua ---> terra 
@@ -220,17 +222,22 @@ static void *orion(void *arg)
     buffer_inserir(&ctx->buf_orion_lua, &p);
 
     pthread_mutex_unlock(&mutex_orion_lua);
+    if (p.temperatura > 80.0 || p.pressao < 50.0)
+        sem_post(&semaforo_orion_lua_cheio_alerta);
+    else
+        sem_post(&semaforo_orion_lua_cheio_normal);
     sem_post(&semaforo_orion_lua_cheio);
 
     //MUTEX
     pthread_mutex_lock(&mutex); 
     ctx->total_enviados++;
+    long total_snapshot = ctx->total_enviados;
     pthread_mutex_unlock(&mutex);
 
+    // Printando uma cópia para evitar race. Logs podem estar fora de ordem, mas tirar
+    // o print de dentro da região crítica diminui o tempo que outras threads podem ficar bloqueadas
+    printf("[Orion %ld] seq=%d enviado | total=%ld\n", meu_id, seq, total_snapshot);
     //FIM
-
-    printf("[Orion %ld] seq=%d enviado | total=%ld\n",
-	  meu_id, seq, ctx->total_enviados);
   }
   return NULL;
 }
@@ -252,8 +259,9 @@ static void *relay(void *arg)
 
     Pacote p;
     //SEMAFORO
-    
     sem_wait(&semaforo_orion_lua_cheio);
+    if (sem_trywait(&semaforo_orion_lua_cheio_alerta) != 0)
+      sem_wait(&semaforo_orion_lua_cheio_normal);
     pthread_mutex_lock(&mutex_orion_lua);
 
     buffer_remover(&ctx->buf_orion_lua, &p);
@@ -272,7 +280,7 @@ static void *relay(void *arg)
 
     if (pr.prioridade == 1)
       printf("[RELAY] *** ALERTA *** Orion=%ld seq=%d temp=%.1f pres=%.1f\n",
-	     p.orion_id, p.seq, p.temperatura, p.pressao);
+	      p.orion_id, p.seq, p.temperatura, p.pressao);
 
     /* Delay FTL simulado (muito menor que rádio) */
     usleep(20);
@@ -287,7 +295,9 @@ static void *relay(void *arg)
     pthread_mutex_unlock(&mutex_lua_terra);
     sem_post(&semaforo_lua_terra_cheio);
 
+    pthread_mutex_lock(&mutex);
     ctx->total_relay++;
+    pthread_mutex_unlock(&mutex);
   }
   return NULL;
 }
@@ -331,12 +341,16 @@ static void *terra(void *arg)
     ctx->total_recebidos++;
   }
 
+  pthread_mutex_lock(&mutex);
+  long snap_enviados  = ctx->total_enviados;
+  long snap_recebidos = ctx->total_recebidos;
+  pthread_mutex_unlock(&mutex);
+
   printf("\n[Terra] Recepção concluída.\n");
-  printf("  Pacotes recebidos : %ld\n",  ctx->total_recebidos);
+  printf("  Pacotes recebidos : %ld\n",  snap_recebidos);
   printf("  Alertas recebidos : %d\n",   alertas);
   printf("  Erros de checksum : %d\n",   erros_checksum);
-  printf("  Enviados vs recebidos: %ld vs %ld\n",
-	 ctx->total_enviados, ctx->total_recebidos);
+  printf("  Enviados vs recebidos: %ld vs %ld\n", snap_enviados, snap_recebidos);
 
   return NULL;
 }
@@ -377,6 +391,8 @@ int main(int argc, char *argv[])
 
   sem_init(&semaforo_orion_lua_vazio, 0, buf_orion_lua);
   sem_init(&semaforo_orion_lua_cheio, 0, 0);
+  sem_init(&semaforo_orion_lua_cheio_alerta, 0, 0);
+  sem_init(&semaforo_orion_lua_cheio_normal, 0, 0);
   pthread_mutex_init(&mutex_orion_lua, NULL);
 
   sem_init(&semaforo_lua_terra_vazio, 0, buf_lua_terra);
@@ -405,6 +421,8 @@ int main(int argc, char *argv[])
   /* Limpeza dos mutex e semaforos */
   sem_destroy(&semaforo_orion_lua_vazio);
   sem_destroy(&semaforo_orion_lua_cheio);
+  sem_destroy(&semaforo_orion_lua_cheio_alerta);
+  sem_destroy(&semaforo_orion_lua_cheio_normal);
   pthread_mutex_destroy(&mutex_orion_lua);
 
   sem_destroy(&semaforo_lua_terra_vazio);
